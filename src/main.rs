@@ -1,11 +1,117 @@
 use std::fs;
+use std::fs::OpenOptions;
 #[allow(unused_imports)]
 use std::io::{self, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::{path::Path, process};
-
 fn not_found(command: &str) {
     println!("{}: command not found", command);
+}
+#[derive(Debug)]
+enum Redirection {
+    None,
+    OutputTo(String),
+    OutputAppend(String),
+    ErrorTo(String),
+    ErrorAppend(String),
+}
+
+fn parse_redirection(tokens: &[String]) -> (Vec<String>, Redirection) {
+    let mut command_parts = Vec::new();
+    let mut redirection = Redirection::None;
+    let mut i = 0;
+
+    while i < tokens.len() {
+        match tokens[i].as_str() {
+            ">" | "1>" => {
+                if i + 1 < tokens.len() {
+                    redirection = Redirection::OutputTo(tokens[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            ">>" | "1>>" => {
+                if i + 1 < tokens.len() {
+                    redirection = Redirection::OutputAppend(tokens[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "2>" => {
+                if i + 1 < tokens.len() {
+                    redirection = Redirection::ErrorTo(tokens[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "2>>" => {
+                if i + 1 < tokens.len() {
+                    redirection = Redirection::ErrorAppend(tokens[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                command_parts.push(tokens[i].clone());
+                i += 1;
+            }
+        }
+    }
+
+    (command_parts, redirection)
+}
+
+fn setup_redirection(
+    redirection: &Redirection,
+) -> io::Result<(Option<fs::File>, Option<fs::File>)> {
+    let mut stdout_file = None;
+    let mut stderr_file = None;
+
+    match redirection {
+        Redirection::OutputTo(path) => {
+            stdout_file = Some(
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)?,
+            );
+        }
+        Redirection::OutputAppend(path) => {
+            stdout_file = Some(
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            );
+        }
+        Redirection::ErrorTo(path) => {
+            stderr_file = Some(
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)?,
+            );
+        }
+        Redirection::ErrorAppend(path) => {
+            stderr_file = Some(
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            );
+        }
+        Redirection::None => {}
+    }
+
+    Ok((stdout_file, stderr_file))
 }
 
 fn tokenize(input: &str) -> Vec<String> {
@@ -69,26 +175,46 @@ fn tokenize(input: &str) -> Vec<String> {
     tokens.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
-fn list_directory(path: &str) -> io::Result<()> {
+fn list_directory(path: &str, redirection: &Redirection) -> io::Result<()> {
     let path = if path.is_empty() { "." } else { path };
-    let entries = fs::read_dir(path)?;
 
-    let mut items: Vec<String> = Vec::new();
-
-    for entry in entries {
-        if let Ok(entry) = entry {
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            if entry.file_type()?.is_dir() {
-                items.push(format!("{}/", file_name));
-            } else {
-                items.push(file_name);
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            let mut items: Vec<String> = Vec::new();
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let file_name = entry.file_name().to_string_lossy().into_owned();
+                    if entry.file_type()?.is_dir() {
+                        items.push(format!("{}/", file_name));
+                    } else {
+                        items.push(file_name);
+                    }
+                }
             }
+
+            items.sort();
+            let output = items.join("\n") + "\n";
+
+            let (stdout_file, _) = setup_redirection(redirection)?;
+            if let Some(mut file) = stdout_file {
+                file.write_all(output.as_bytes())?;
+            } else {
+                print!("{}", output);
+            }
+            Ok(())
+        }
+        Err(_) => {
+            let error_msg = format!("ls: cannot access '{}': No such file or directory\n", path);
+
+            let (_, stderr_file) = setup_redirection(redirection)?;
+            if let Some(mut file) = stderr_file {
+                file.write_all(error_msg.as_bytes())?;
+            } else {
+                eprint!("{}", error_msg);
+            }
+            Ok(())
         }
     }
-
-    items.sort();
-    println!("{}", items.join(" "));
-    Ok(())
 }
 
 fn find_in_path(command: &str, path: &str) -> Option<String> {
@@ -133,9 +259,37 @@ fn find_in_path(command: &str, path: &str) -> Option<String> {
     None
 }
 
-fn execute_command(command: &str, args: &[String], env_path: &str) -> io::Result<()> {
+fn execute_command(
+    command: &str,
+    args: &[String],
+    env_path: &str,
+    redirection: Redirection,
+) -> io::Result<()> {
     if command == "ls" {
-        return list_directory(args.first().map(String::as_str).unwrap_or(""));
+        return list_directory(args.first().map(String::as_str).unwrap_or(""), &redirection);
+    }
+
+    if command == "echo" {
+        let output = args.join(" ") + "\n";
+        match &redirection {
+            Redirection::ErrorTo(_) | Redirection::ErrorAppend(_) => {
+                print!("{}", output);
+                let (_, stderr_file) = setup_redirection(&redirection)?;
+                if let Some(mut file) = stderr_file {
+                    file.write_all(&[])?;
+                }
+            }
+            Redirection::None => {
+                print!("{}", output);
+            }
+            _ => {
+                let (stdout_file, _) = setup_redirection(&redirection)?;
+                if let Some(mut file) = stdout_file {
+                    file.write_all(output.as_bytes())?;
+                }
+            }
+        }
+        return Ok(());
     }
 
     let program = if command.starts_with('\'') || command.starts_with('"') {
@@ -150,12 +304,61 @@ fn execute_command(command: &str, args: &[String], env_path: &str) -> io::Result
         }
     };
 
-    let output = Command::new(program)
-        .args(args)
-        .output()?;
-    
-    io::stdout().write_all(&output.stdout)?;
-    io::stderr().write_all(&output.stderr)?;
+    let mut cmd = Command::new(&program);
+    cmd.args(args);
+
+    match &redirection {
+        Redirection::ErrorTo(path) | Redirection::ErrorAppend(path) => {
+            cmd.stdout(Stdio::inherit());
+            cmd.stderr(Stdio::piped());
+            let output = cmd.output()?;
+
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let cleaned_stderr = stderr_str.replace(&format!("/usr/bin/{}", command), command);
+
+            let mut file = if matches!(redirection, Redirection::ErrorTo(_)) {
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)?
+            } else {
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .append(true)
+                    .open(path)?
+            };
+            file.write_all(cleaned_stderr.as_bytes())?;
+        }
+        Redirection::OutputTo(path) | Redirection::OutputAppend(path) => {
+            cmd.stderr(Stdio::inherit());
+            cmd.stdout(Stdio::piped());
+            let output = cmd.output()?;
+
+            let mut file = if matches!(redirection, Redirection::OutputTo(_)) {
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)?
+            } else {
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .append(true)
+                    .open(path)?
+            };
+            file.write_all(&output.stdout)?;
+        }
+        Redirection::None => {
+            let status = cmd.status()?;
+            if !status.success() {
+                return Ok(());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -199,10 +402,33 @@ fn main() {
             continue;
         }
 
-        match tokens.as_slice() {
+        let (command_parts, redirection) = parse_redirection(&tokens);
+        if command_parts.is_empty() {
+            continue;
+        }
+
+        match command_parts.as_slice() {
             [exit_cmd, code] if exit_cmd == "exit" => process::exit(code.parse::<i32>().unwrap()),
             [echo_cmd, args @ ..] if echo_cmd == "echo" => {
-                println!("{}", args.join(" "));
+                let output = args.join(" ") + "\n";
+                match &redirection {
+                    Redirection::ErrorTo(_) | Redirection::ErrorAppend(_) => {
+                        print!("{}", output);
+                        let (_, stderr_file) = setup_redirection(&redirection).unwrap();
+                        if let Some(mut file) = stderr_file {
+                            file.write_all(&[]).unwrap();
+                        }
+                    }
+                    Redirection::None => {
+                        print!("{}", output);
+                    }
+                    _ => {
+                        let (stdout_file, _) = setup_redirection(&redirection).unwrap();
+                        if let Some(mut file) = stdout_file {
+                            file.write_all(output.as_bytes()).unwrap();
+                        }
+                    }
+                }
             }
             [pwd_cmd] if pwd_cmd == "pwd" => match std::env::current_dir() {
                 Ok(path) => println!("{}", path.display()),
@@ -216,17 +442,17 @@ fn main() {
                 let _ = change_directory(path);
             }
             [ls_cmd] | [ls_cmd, _] if ls_cmd == "ls" => {
-                let path = tokens.get(1).map(String::as_str).unwrap_or("");
-                if let Err(e) = list_directory(path) {
+                let path = command_parts.get(1).map(String::as_str).unwrap_or("");
+                if let Err(e) = list_directory(path, &redirection) {
                     eprintln!("ls: {}: {}", path, e);
                 }
             }
             [type_cmd, ..] if type_cmd == "type" => {
-                if tokens.len() != 2 {
-                    println!("type: expected 1 argument, got {}", tokens.len() - 1);
+                if command_parts.len() != 2 {
+                    println!("type: expected 1 argument, got {}", command_parts.len() - 1);
                     continue;
                 }
-                let command = &tokens[1];
+                let command = &command_parts[1];
                 if ["exit", "echo", "type", "pwd", "cd", "ls"].contains(&command.as_str()) {
                     println!("{} is a shell builtin", command);
                     continue;
@@ -237,13 +463,12 @@ fn main() {
                 }
             }
             _ => {
-                let command = &tokens[0];
-                let args = &tokens[1..];
-                if let Err(e) = execute_command(command, args, &env_path) {
+                let command = &command_parts[0];
+                let args = &command_parts[1..];
+                if let Err(e) = execute_command(command, args, &env_path, redirection) {
                     eprintln!("Error executing command: {}", e);
                 }
             }
         }
     }
 }
-
