@@ -1,4 +1,4 @@
-add piping operator 
-fix the redirection of output
-add the AUTOCOMPLETE FUNCTION
-add the JOB CONTROL
+add piping operator  -- done  
+fix the redirection of output -- done 
+add the AUTOCOMPLETE FUNCTION 
+add the Arrow function up and down to move through history of commands 
