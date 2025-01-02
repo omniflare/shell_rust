@@ -1,12 +1,26 @@
+use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
-#[allow(unused_imports)]
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::{path::Path, process};
 
-fn not_found(command: &str) {
-    println!("{}: command not found", command);
+#[derive(Debug, PartialEq, Clone)]
+enum TokenType {
+    Word(String),
+    Pipe,
+    Redirect(RedirectType),
+    And,
+    Semicolon,
+    Quote(String, bool),
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum RedirectType {
+    Output,
+    Append,
+    Error,
+    ErrorAppend,
 }
 
 #[derive(Debug, Clone)]
@@ -26,137 +40,136 @@ struct PipelineCommand {
     redirection: Redirection,
 }
 
-fn parse_redirection(tokens: &[String]) -> (Vec<String>, Redirection) {
-    let mut command_parts = Vec::new();
-    let mut redirection = Redirection::None;
-    let mut i = 0;
-
-    while i < tokens.len() {
-        match tokens[i].as_str() {
-            ">" | "1>" => {
-                if i + 1 < tokens.len() {
-                    redirection = Redirection::OutputTo(tokens[i + 1].clone());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            ">>" | "1>>" => {
-                if i + 1 < tokens.len() {
-                    redirection = Redirection::OutputAppend(tokens[i + 1].clone());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "2>" => {
-                if i + 1 < tokens.len() {
-                    redirection = Redirection::ErrorTo(tokens[i + 1].clone());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "2>>" => {
-                if i + 1 < tokens.len() {
-                    redirection = Redirection::ErrorAppend(tokens[i + 1].clone());
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            "|" => {
-                redirection = Redirection::Pipe;
-                i += 1;
-            }
-            _ => {
-                command_parts.push(tokens[i].clone());
-                i += 1;
-            }
-        }
-    }
-
-    (command_parts, redirection)
+struct Lexer {
+    input: Vec<char>,
+    position: usize,
+    env_vars: HashMap<String, String>,
 }
 
-// fn setup_redirection(
-//     redirection: &Redirection,
-//     stdout_pipe: Option<Stdio>,
-// ) -> io::Result<(Option<Stdio>, Option<Stdio>)> {
-//     let stdout = match redirection {
-//         Redirection::OutputTo(path) => Some(Stdio::from(
-//             OpenOptions::new()
-//                 .write(true)
-//                 .create(true)
-//                 .truncate(true)
-//                 .open(path)?,
-//         )),
-//         Redirection::OutputAppend(path) => Some(Stdio::from(
-//             OpenOptions::new()
-//                 .write(true)
-//                 .create(true)
-//                 .append(true)
-//                 .open(path)?,
-//         )),
-//         Redirection::Pipe => stdout_pipe,
-//         _ => None,
-//     };
+impl Iterator for Lexer {
+    type Item = TokenType;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_token()
+    }
+}
 
-//     let stderr = match redirection {
-//         Redirection::ErrorTo(path) => Some(Stdio::from(
-//             OpenOptions::new()
-//                 .write(true)
-//                 .create(true)
-//                 .truncate(true)
-//                 .open(path)?,
-//         )),
-//         Redirection::ErrorAppend(path) => Some(Stdio::from(
-//             OpenOptions::new()
-//                 .write(true)
-//                 .create(true)
-//                 .append(true)
-//                 .open(path)?,
-//         )),
-//         _ => None,
-//     };
+impl Lexer {
+    fn new(input: &str, env_vars: HashMap<String, String>) -> Self {
+        Lexer {
+            input: input.chars().collect(),
+            position: 0,
+            env_vars,
+        }
+    }
 
-//     Ok((stdout, stderr))
-// }
+    fn peek(&self) -> Option<char> {
+        self.input.get(self.position).copied()
+    }
 
-fn parse_pipeline(tokens: &[String]) -> Vec<PipelineCommand> {
-    let mut pipeline = Vec::new();
-    let mut current_command = Vec::new();
-
-    for token in tokens {
-        if token == "|" {
-            if !current_command.is_empty() {
-                let (command_parts, _) = parse_redirection(&current_command);
-                if !command_parts.is_empty() {
-                    pipeline.push(PipelineCommand {
-                        command: command_parts[0].clone(),
-                        args: command_parts[1..].to_vec(),
-                        redirection: Redirection::Pipe,
-                    });
-                }
-                current_command.clear();
-            }
+    fn advance(&mut self) -> Option<char> {
+        if self.position < self.input.len() {
+            let current = self.input[self.position];
+            self.position += 1;
+            Some(current)
         } else {
-            current_command.push(token.clone());
+            None
         }
     }
 
-    if !current_command.is_empty() {
-        let (command_parts, redirection) = parse_redirection(&current_command);
-        if !command_parts.is_empty() {
-            pipeline.push(PipelineCommand {
-                command: command_parts[0].clone(),
-                args: command_parts[1..].to_vec(),
-                redirection,
-            });
+    fn lex_quote(&mut self, quote_char: char) -> Option<TokenType> {
+        let mut content = String::new();
+        let is_single = quote_char == '\'';
+
+        while let Some(c) = self.advance() {
+            if c == quote_char {
+                return Some(TokenType::Quote(content, is_single));
+            }
+            if c == '\\' && !is_single {
+                if let Some(next) = self.advance() {
+                    content.push(next);
+                }
+            } else if c == '$' && !is_single {
+                if let Some(var) = self.lex_variable() {
+                    content.push_str(&var);
+                }
+            } else {
+                content.push(c);
+            }
+        }
+        None
+    }
+
+    fn lex_variable(&mut self) -> Option<String> {
+        let mut var_name = String::new();
+        while let Some(c) = self.peek() {
+            if c.is_alphanumeric() || c == '_' {
+                var_name.push(c);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.env_vars.get(&var_name).cloned()
+    }
+
+    fn lex_redirect(&mut self) -> TokenType {
+        match self.peek() {
+            Some('>') => {
+                self.advance();
+                TokenType::Redirect(RedirectType::Append)
+            }
+            Some('2') if self.input.get(self.position + 1) == Some(&'>') => {
+                self.advance();
+                self.advance();
+                if self.peek() == Some('>') {
+                    self.advance();
+                    TokenType::Redirect(RedirectType::ErrorAppend)
+                } else {
+                    TokenType::Redirect(RedirectType::Error)
+                }
+            }
+            _ => TokenType::Redirect(RedirectType::Output),
         }
     }
 
-    pipeline
+    fn next_token(&mut self) -> Option<TokenType> {
+        while let Some(c) = self.advance() {
+            match c {
+                ' ' | '\t' | '\n' => continue,
+                '|' => return Some(TokenType::Pipe),
+                '>' => return Some(self.lex_redirect()),
+                ';' => return Some(TokenType::Semicolon),
+                '\'' | '"' => return self.lex_quote(c),
+                '$' => {
+                    if let Some(var) = self.lex_variable() {
+                        return Some(TokenType::Word(var));
+                    }
+                }
+                '&' if self.peek() == Some('&') => {
+                    self.advance();
+                    return Some(TokenType::And);
+                }
+                _ => {
+                    let mut word = String::from(c);
+                    while let Some(next) = self.peek() {
+                        if next.is_whitespace() || ")|><;&".contains(next) {
+                            break;
+                        }
+                        word.push(next);
+                        self.advance();
+                    }
+                    return Some(TokenType::Word(word));
+                }
+            }
+        }
+        None
+    }
+}
+
+// helper functions
+
+fn not_found(command: &str) {
+    println!("{}: command not found", command);
 }
 
 fn execute_command(
@@ -181,7 +194,6 @@ fn execute_command(
     let mut cmd = Command::new(&program);
     cmd.args(args);
 
-    // Set up stdin if provided
     if let Some(stdin) = stdin {
         cmd.stdin(stdin);
     }
@@ -250,62 +262,79 @@ fn execute_command(
     }
 }
 
-fn tokenize(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current_token = String::new();
-    let mut in_single_quotes = false;
-    let mut in_double_quotes = false;
-    let mut chars = input.chars().peekable();
-    let mut escaped = false;
+fn parse_command(tokens: &[TokenType]) -> Option<PipelineCommand> {
+    let mut command = None;
+    let mut args = Vec::new();
+    let mut redirection = Redirection::None;
+    let mut i = 0;
 
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if !in_single_quotes => {
-                if let Some(&next_char) = chars.peek() {
-                    if in_double_quotes {
-                        match next_char {
-                            '\\' | '$' | '"' | '\n' => {
-                                chars.next();
-                                current_token.push(next_char);
-                            }
-                            _ => {
-                                current_token.push('\\');
-                                current_token.push(next_char);
-                                chars.next();
-                            }
-                        }
+    while i < tokens.len() {
+        match &tokens[i] {
+            TokenType::Word(word) | TokenType::Quote(word, _) => {
+                if command.is_none() {
+                    command = Some(word.clone());
+                } else {
+                    args.push(word.clone());
+                }
+                i += 1;
+            }
+            TokenType::Redirect(redir_type) => {
+                if i + 1 < tokens.len() {
+                    if let TokenType::Word(path) | TokenType::Quote(path, _) = &tokens[i + 1] {
+                        redirection = match redir_type {
+                            RedirectType::Output => Redirection::OutputTo(path.clone()),
+                            RedirectType::Append => Redirection::OutputAppend(path.clone()),
+                            RedirectType::Error => Redirection::ErrorTo(path.clone()),
+                            RedirectType::ErrorAppend => Redirection::ErrorAppend(path.clone()),
+                        };
+                        i += 2;
                     } else {
-                        chars.next();
-                        current_token.push(next_char);
+                        i += 1;
                     }
                 } else {
-                    current_token.push('\\');
+                    i += 1;
                 }
             }
-            '\'' if !escaped && !in_double_quotes => {
-                in_single_quotes = !in_single_quotes;
+            TokenType::Pipe => {
+                redirection = Redirection::Pipe;
+                i += 1;
             }
-            '"' if !escaped && !in_single_quotes => {
-                in_double_quotes = !in_double_quotes;
-            }
-            ' ' if !escaped && !in_single_quotes && !in_double_quotes => {
-                if !current_token.is_empty() {
-                    tokens.push(current_token.clone());
-                    current_token.clear();
-                }
-            }
-            _ => {
-                current_token.push(c);
-            }
+            _ => i += 1,
         }
-        escaped = false;
     }
 
-    if !current_token.is_empty() {
-        tokens.push(current_token);
+    command.map(|cmd| PipelineCommand {
+        command: cmd,
+        args,
+        redirection,
+    })
+}
+
+fn parse_pipeline(tokens: Vec<TokenType>) -> Vec<PipelineCommand> {
+    let mut pipeline = Vec::new();
+    let mut current_tokens = Vec::new();
+
+    for token in tokens {
+        match token {
+            TokenType::Pipe => {
+                if !current_tokens.is_empty() {
+                    if let Some(command) = parse_command(&current_tokens) {
+                        pipeline.push(command);
+                    }
+                    current_tokens.clear();
+                }
+            }
+            _ => current_tokens.push(token),
+        }
     }
 
-    tokens.into_iter().filter(|s| !s.is_empty()).collect()
+    if !current_tokens.is_empty() {
+        if let Some(command) = parse_command(&current_tokens) {
+            pipeline.push(command);
+        }
+    }
+
+    pipeline
 }
 
 fn find_in_path(command: &str, path: &str) -> Option<String> {
@@ -374,48 +403,49 @@ fn change_directory(path: &str) -> io::Result<()> {
 
 fn main() {
     let env_path = std::env::var("PATH").unwrap();
+    let mut env_vars = HashMap::new();
+    env_vars.insert(
+        "HOME".to_string(),
+        std::env::var("HOME").unwrap_or_default(),
+    );
+    env_vars.insert("PATH".to_string(), env_path.clone());
+
     loop {
         print!("$ ");
         if io::stdout().flush().is_err() {
-            println!("error while doing the stdout");
+            println!("Error flushing stdout");
             continue;
         }
 
-        let stdin = io::stdin();
         let mut input = String::new();
-        stdin.read_line(&mut input).unwrap();
-        let command = input.trim();
-        let tokens = tokenize(command);
+        if io::stdin().read_line(&mut input).is_err() {
+            continue;
+        }
+
+        let lexer = Lexer::new(input.trim(), env_vars.clone());
+        let tokens: Vec<TokenType> = lexer.into_iter().collect();
 
         if tokens.is_empty() {
             continue;
         }
 
-        let pipeline = parse_pipeline(&tokens);
+        let pipeline = parse_pipeline(tokens);
         if pipeline.is_empty() {
             continue;
         }
-        
+
         if pipeline.len() == 1 {
             let cmd = &pipeline[0];
             match cmd.command.as_str() {
-                "exit" if !cmd.args.is_empty() => {
-                    process::exit(cmd.args[0].parse::<i32>().unwrap_or(0))
-                }
+                "exit" => process::exit(cmd.args.first().and_then(|s| s.parse().ok()).unwrap_or(0)),
                 "cd" => {
                     let path = cmd.args.first().map(String::as_str).unwrap_or("");
                     let _ = if path.is_empty() {
-                        let home = std::env::var("HOME").unwrap_or_default();
+                        let home = env_vars.get("HOME").cloned().unwrap_or_default();
                         change_directory(&home)
                     } else {
                         change_directory(path)
                     };
-                    continue;
-                }
-                "pwd" => {
-                    if let Ok(path) = std::env::current_dir() {
-                        println!("{}", path.display());
-                    }
                     continue;
                 }
                 _ => {}
@@ -431,10 +461,14 @@ fn main() {
                 Redirection::Pipe
             };
 
-            match execute_command(&cmd.command, &cmd.args, &env_path, redirection, previous_output) {
-                Ok(output) => {
-                    previous_output = output;
-                }
+            match execute_command(
+                &cmd.command,
+                &cmd.args,
+                &env_path,
+                redirection,
+                previous_output,
+            ) {
+                Ok(output) => previous_output = output,
                 Err(e) => {
                     eprintln!("Error executing command: {}", e);
                     break;
@@ -443,3 +477,107 @@ fn main() {
         }
     }
 }
+
+// earlier mode of redirection --saved for reference
+// fn setup_redirection(
+//     redirection: &Redirection,
+//     stdout_pipe: Option<Stdio>,
+// ) -> io::Result<(Option<Stdio>, Option<Stdio>)> {
+//     let stdout = match redirection {
+//         Redirection::OutputTo(path) => Some(Stdio::from(
+//             OpenOptions::new()
+//                 .write(true)
+//                 .create(true)
+//                 .truncate(true)
+//                 .open(path)?,
+//         )),
+//         Redirection::OutputAppend(path) => Some(Stdio::from(
+//             OpenOptions::new()
+//                 .write(true)
+//                 .create(true)
+//                 .append(true)
+//                 .open(path)?,
+//         )),
+//         Redirection::Pipe => stdout_pipe,
+//         _ => None,
+//     };
+
+//     let stderr = match redirection {
+//         Redirection::ErrorTo(path) => Some(Stdio::from(
+//             OpenOptions::new()
+//                 .write(true)
+//                 .create(true)
+//                 .truncate(true)
+//                 .open(path)?,
+//         )),
+//         Redirection::ErrorAppend(path) => Some(Stdio::from(
+//             OpenOptions::new()
+//                 .write(true)
+//                 .create(true)
+//                 .append(true)
+//                 .open(path)?,
+//         )),
+//         _ => None,
+//     };
+
+//     Ok((stdout, stderr))
+// }
+
+// Basic version of lexer (if you want to implement using this)
+// fn tokenize(input: &str) -> Vec<String> {
+//     let mut tokens = Vec::new();
+//     let mut current_token = String::new();
+//     let mut in_single_quotes = false;
+//     let mut in_double_quotes = false;
+//     let mut chars = input.chars().peekable();
+//     let mut escaped = false;
+
+//     while let Some(c) = chars.next() {
+//         match c {
+//             '\\' if !in_single_quotes => {
+//                 if let Some(&next_char) = chars.peek() {
+//                     if in_double_quotes {
+//                         match next_char {
+//                             '\\' | '$' | '"' | '\n' => {
+//                                 chars.next();
+//                                 current_token.push(next_char);
+//                             }
+//                             _ => {
+//                                 current_token.push('\\');
+//                                 current_token.push(next_char);
+//                                 chars.next();
+//                             }
+//                         }
+//                     } else {
+//                         chars.next();
+//                         current_token.push(next_char);
+//                     }
+//                 } else {
+//                     current_token.push('\\');
+//                 }
+//             }
+//             '\'' if !escaped && !in_double_quotes => {
+//                 in_single_quotes = !in_single_quotes;
+//             }
+//             '"' if !escaped && !in_single_quotes => {
+//                 in_double_quotes = !in_double_quotes;
+//             }
+//             ' ' if !escaped && !in_single_quotes && !in_double_quotes => {
+//                 if !current_token.is_empty() {
+//                     tokens.push(current_token.clone());
+//                     current_token.clear();
+//                 }
+//             }
+//             _ => {
+//                 current_token.push(c);
+//             }
+//         }
+//         escaped = false;
+//     }
+
+//     if !current_token.is_empty() {
+//         tokens.push(current_token);
+//     }
+
+//     tokens.into_iter().filter(|s| !s.is_empty()).collect()
+// }
