@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Write, Read};
 use std::process::{Command, Stdio};
 use std::{path::Path, process};
+use std::env;
 
 #[derive(Debug, PartialEq, Clone)]
 enum TokenType {
@@ -45,6 +46,16 @@ struct Lexer {
     input: Vec<char>,
     position: usize,
     env_vars: HashMap<String, String>,
+}
+
+const HISTORY_FILE_NAME: &str = ".rush_history";
+const MAX_HISTORY: usize = 1000;
+
+#[derive(Debug)]
+struct History {
+    entries: Vec<String>,
+    position: isize,
+    history_file_path: String,
 }
 
 impl Iterator for Lexer {
@@ -172,6 +183,81 @@ impl Lexer {
         None
     }
 }
+
+impl History {
+    fn new() -> Self {
+        let home_dir = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let history_file_path = format!("{}/{}", home_dir, HISTORY_FILE_NAME);
+        
+        let mut history = History {
+            entries: Vec::new(),
+            position: -1,
+            history_file_path,
+        };
+        history.load_from_file();
+        history
+    }
+
+    fn load_from_file(&mut self) {
+        if let Ok(mut file) = File::open(&self.history_file_path) {
+            let mut contents = String::new();
+            if file.read_to_string(&mut contents).is_ok() {
+                self.entries = contents.lines()
+                    .map(String::from)
+                    .collect::<Vec<_>>();
+                self.position = self.entries.len() as isize;
+            }
+        }
+    }
+
+    fn save_to_file(&self) {
+        if let Ok(mut file) = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.history_file_path)
+        {
+            for entry in &self.entries {
+                writeln!(file, "{}", entry).ok();
+            }
+        }
+    }
+
+    fn add(&mut self, command: String) {
+        if !command.trim().is_empty() && self.entries.last().map_or(true, |last| last != &command) {
+            self.entries.push(command);
+            if self.entries.len() > MAX_HISTORY {
+                self.entries.remove(0);
+            }
+            self.position = self.entries.len() as isize;
+            self.save_to_file();
+        }
+    }
+
+    fn get_previous(&mut self) -> Option<&String> {
+        if self.position > 0 && !self.entries.is_empty() {
+            self.position -= 1;
+            self.entries.get(self.position as usize)
+        } else {
+            self.entries.get(0)
+        }
+    }
+
+    fn get_next(&mut self) -> Option<&String> {
+        if (self.position + 1) < self.entries.len() as isize {
+            self.position += 1;
+            self.entries.get(self.position as usize)
+        } else {
+            self.position = self.entries.len() as isize;
+            None
+        }
+    }
+
+    fn reset_position(&mut self) {
+        self.position = self.entries.len() as isize;
+    }
+}
+
 
 // helper functions
 
@@ -424,15 +510,15 @@ fn change_directory(path: &str) -> io::Result<()> {
     }
 }
 
-fn main() {
-    let env_path = std::env::var("PATH").unwrap();
-    let mut env_vars = HashMap::new();
-    env_vars.insert(
-        "HOME".to_string(),
-        std::env::var("HOME").unwrap_or_default(),
-    );
-    env_vars.insert("PATH".to_string(), env_path.clone());
 
+fn main() {
+     let env_path = std::env::var("PATH").unwrap();
+    let mut env_vars = HashMap::new();
+    env_vars.insert("HOME".to_string(), std::env::var("HOME").unwrap_or_default());
+    env_vars.insert("PATH".to_string(), env_path.clone());
+    
+    let mut history = History::new();
+    
     loop {
         print!("$ ");
         if io::stdout().flush().is_err() {
@@ -440,18 +526,86 @@ fn main() {
             continue;
         }
 
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
+        let mut current_input = String::new();
+        let stdin = io::stdin();
+        let mut stdout = io::stdout();
+        let mut chars = stdin.bytes();
+
+        'input: loop {
+            match chars.next() {
+                Some(Ok(b'\n')) => {
+                    println!();
+                    break;
+                }
+                Some(Ok(3)) => { // Ctrl-C
+                    println!("^C");
+                    current_input.clear();
+                    break;
+                }
+                Some(Ok(4)) => { // Ctrl-D
+                    if current_input.is_empty() {
+                        println!();
+                        process::exit(0);
+                    }
+                }
+                Some(Ok(27)) => {
+                    if let (Some(Ok(91)), Some(Ok(code))) = (chars.next(), chars.next()) {
+                        match code {
+                            65 => {
+                                if let Some(previous) = history.get_previous() {
+                                    print!("\r$ {}", " ".repeat(current_input.len()));
+                                    print!("\r$ {}", previous);
+                                    stdout.flush().unwrap();
+                                    current_input = previous.clone();
+                                }
+                            }
+                            66 => { 
+                                print!("\r$ {}", " ".repeat(current_input.len()));
+                                if let Some(next) = history.get_next() {
+                                    print!("\r$ {}", next);
+                                    current_input = next.clone();
+                                } else {
+                                    print!("\r$ ");
+                                    current_input.clear();
+                                }
+                                stdout.flush().unwrap();
+                            }
+                            _ => {}
+                        }
+                        continue 'input;
+                    }
+                }
+                Some(Ok(127)) => { 
+                    if !current_input.is_empty() {
+                        current_input.pop();
+                        print!("\r$ {}", " ".repeat(current_input.len() + 1));
+                        print!("\r$ {}", current_input);
+                        stdout.flush().unwrap();
+                    }
+                }
+                Some(Ok(c)) => {
+                    current_input.push(c as char);
+                    print!("{}", c as char);
+                    stdout.flush().unwrap();
+                }
+                _ => {}
+            }
+        }
+
+        if current_input.trim().is_empty() {
             continue;
         }
 
-        let lexer = Lexer::new(input.trim(), env_vars.clone());
+        if !current_input.trim().is_empty() {
+            history.add(current_input.clone());
+        }
+
+        let lexer = Lexer::new(&current_input, env_vars.clone());
         let tokens: Vec<TokenType> = lexer.into_iter().collect();
 
         if tokens.is_empty() {
             continue;
         }
-
         let pipelines = parse_pipeline(tokens);
         if pipelines.is_empty() {
             continue;
@@ -507,7 +661,6 @@ fn main() {
                 }
             }
 
-            // Handle logical operators
             match operator {
                 Some(TokenType::And) if !last_success => break 'pipeline_loop,
                 Some(TokenType::Or) if last_success => break 'pipeline_loop,
