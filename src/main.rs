@@ -11,6 +11,7 @@ enum TokenType {
     Pipe,
     Redirect(RedirectType),
     And,
+    Or,  
     Semicolon,
     Quote(String, bool),
 }
@@ -136,7 +137,13 @@ impl Lexer {
         while let Some(c) = self.advance() {
             match c {
                 ' ' | '\t' | '\n' => continue,
-                '|' => return Some(TokenType::Pipe),
+                '|' => {
+                    if self.peek() == Some('|') {
+                        self.advance();
+                        return Some(TokenType::Or);
+                    }
+                    return Some(TokenType::Pipe);
+                }
                 '>' => return Some(self.lex_redirect()),
                 ';' => return Some(TokenType::Semicolon),
                 '\'' | '"' => return self.lex_quote(c),
@@ -178,7 +185,7 @@ fn execute_command(
     env_path: &str,
     redirection: Redirection,
     stdin: Option<Stdio>,
-) -> io::Result<Option<Stdio>> {
+) -> io::Result<(Option<Stdio>, bool)> {
     let program = if command.starts_with('\'') || command.starts_with('"') {
         command.to_string()
     } else {
@@ -186,7 +193,7 @@ fn execute_command(
             Some(path) => path,
             None => {
                 not_found(command);
-                return Ok(None);
+                return Ok((None, false));
             }
         }
     };
@@ -202,13 +209,15 @@ fn execute_command(
         Redirection::Pipe => {
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::inherit());
-            let child = cmd.spawn()?;
-            Ok(child.stdout.map(Stdio::from))
+            let mut child = cmd.spawn()?;
+            let success = child.wait()?.success();
+            Ok((child.stdout.map(Stdio::from), success))
         }
         Redirection::ErrorTo(path) | Redirection::ErrorAppend(path) => {
             cmd.stdout(Stdio::inherit());
             cmd.stderr(Stdio::piped());
             let output = cmd.output()?;
+            let success = output.status.success();
 
             let stderr_str = String::from_utf8_lossy(&output.stderr);
             let cleaned_stderr = stderr_str.replace(&format!("/usr/bin/{}", command), command);
@@ -227,12 +236,13 @@ fn execute_command(
                     .open(path)?
             };
             file.write_all(cleaned_stderr.as_bytes())?;
-            Ok(None)
+            Ok((None, success))
         }
         Redirection::OutputTo(path) | Redirection::OutputAppend(path) => {
             cmd.stderr(Stdio::inherit());
             cmd.stdout(Stdio::piped());
             let output = cmd.output()?;
+            let success = output.status.success();
 
             let mut file = if matches!(redirection, Redirection::OutputTo(_)) {
                 OpenOptions::new()
@@ -248,16 +258,13 @@ fn execute_command(
                     .open(path)?
             };
             file.write_all(&output.stdout)?;
-            Ok(None)
+            Ok((None, success))
         }
         Redirection::None => {
             cmd.stdout(Stdio::inherit());
             cmd.stderr(Stdio::inherit());
             let status = cmd.status()?;
-            if !status.success() {
-                return Ok(None);
-            }
-            Ok(None)
+            Ok((None, status.success()))
         }
     }
 }
@@ -310,31 +317,47 @@ fn parse_command(tokens: &[TokenType]) -> Option<PipelineCommand> {
     })
 }
 
-fn parse_pipeline(tokens: Vec<TokenType>) -> Vec<PipelineCommand> {
-    let mut pipeline = Vec::new();
+fn parse_pipeline(tokens: Vec<TokenType>) -> Vec<(Vec<PipelineCommand>, Option<TokenType>)> {
+    let mut pipelines = Vec::new();
+    let mut current_pipeline = Vec::new();
     let mut current_tokens = Vec::new();
 
-    for token in tokens {
+    for token in tokens.iter() {
         match token {
             TokenType::Pipe => {
                 if !current_tokens.is_empty() {
                     if let Some(command) = parse_command(&current_tokens) {
-                        pipeline.push(command);
+                        current_pipeline.push(command);
                     }
                     current_tokens.clear();
                 }
             }
-            _ => current_tokens.push(token),
+            TokenType::And | TokenType::Or | TokenType::Semicolon => {
+                if !current_tokens.is_empty() {
+                    if let Some(command) = parse_command(&current_tokens) {
+                        current_pipeline.push(command);
+                    }
+                    current_tokens.clear();
+                }
+                if !current_pipeline.is_empty() {
+                    pipelines.push((current_pipeline, Some(token.clone())));
+                    current_pipeline = Vec::new();
+                }
+            }
+            _ => current_tokens.push(token.clone()),
         }
     }
 
     if !current_tokens.is_empty() {
         if let Some(command) = parse_command(&current_tokens) {
-            pipeline.push(command);
+            current_pipeline.push(command);
         }
     }
+    if !current_pipeline.is_empty() {
+        pipelines.push((current_pipeline, None));
+    }
 
-    pipeline
+    pipelines
 }
 
 fn find_in_path(command: &str, path: &str) -> Option<String> {
@@ -429,50 +452,66 @@ fn main() {
             continue;
         }
 
-        let pipeline = parse_pipeline(tokens);
-        if pipeline.is_empty() {
+        let pipelines = parse_pipeline(tokens);
+        if pipelines.is_empty() {
             continue;
         }
 
-        if pipeline.len() == 1 {
-            let cmd = &pipeline[0];
-            match cmd.command.as_str() {
-                "exit" => process::exit(cmd.args.first().and_then(|s| s.parse().ok()).unwrap_or(0)),
-                "cd" => {
-                    let path = cmd.args.first().map(String::as_str).unwrap_or("");
-                    let _ = if path.is_empty() {
-                        let home = env_vars.get("HOME").cloned().unwrap_or_default();
-                        change_directory(&home)
-                    } else {
-                        change_directory(path)
-                    };
-                    continue;
+        let mut last_success = true;
+        'pipeline_loop: for (pipeline, operator) in pipelines {
+            if pipeline.len() == 1 {
+                let cmd = &pipeline[0];
+                match cmd.command.as_str() {
+                    "exit" => {
+                        process::exit(cmd.args.first().and_then(|s| s.parse().ok()).unwrap_or(0))
+                    }
+                    "cd" => {
+                        let path = cmd.args.first().map(String::as_str).unwrap_or("");
+                        last_success = if path.is_empty() {
+                            let home = env_vars.get("HOME").cloned().unwrap_or_default();
+                            change_directory(&home).is_ok()
+                        } else {
+                            change_directory(path).is_ok()
+                        };
+                        continue;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
 
-        let mut previous_output = None;
-        for (i, cmd) in pipeline.iter().enumerate() {
-            let is_last = i == pipeline.len() - 1;
-            let redirection = if is_last {
-                cmd.redirection.clone()
-            } else {
-                Redirection::Pipe
-            };
+            let mut previous_output = None;
+            for (i, cmd) in pipeline.iter().enumerate() {
+                let is_last = i == pipeline.len() - 1;
+                let redirection = if is_last {
+                    cmd.redirection.clone()
+                } else {
+                    Redirection::Pipe
+                };
 
-            match execute_command(
-                &cmd.command,
-                &cmd.args,
-                &env_path,
-                redirection,
-                previous_output,
-            ) {
-                Ok(output) => previous_output = output,
-                Err(e) => {
-                    eprintln!("Error executing command: {}", e);
-                    break;
+                match execute_command(
+                    &cmd.command,
+                    &cmd.args,
+                    &env_path,
+                    redirection,
+                    previous_output,
+                ) {
+                    Ok((output, success)) => {
+                        previous_output = output;
+                        last_success = success;
+                    }
+                    Err(e) => {
+                        eprintln!("Error executing command: {}", e);
+                        last_success = false;
+                        break;
+                    }
                 }
+            }
+
+            // Handle logical operators
+            match operator {
+                Some(TokenType::And) if !last_success => break 'pipeline_loop,
+                Some(TokenType::Or) if last_success => break 'pipeline_loop,
+                _ => {}
             }
         }
     }
